@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-#  PasarGuard Fallback Manager  v1.3
+#  PasarGuard Fallback Manager  v1.4
 #  Local nginx decoy backend for PasarGuard VLESS fallback.
 #
 #  Roles:
@@ -72,8 +72,11 @@ write_relay_conf(){
 "; done
         allow_block+="    deny all;"
     fi
+    mkdir -p /var/cache/nginx/pg-fallback
     cat > "$RELAY_CONF" <<EOF
 # managed-by-pg-fallback (relay)
+proxy_cache_path /var/cache/nginx/pg-fallback levels=1:2 keys_zone=pgfb:10m max_size=100m inactive=60m use_temp_path=off;
+
 server {
     listen 0.0.0.0:${RELAY_PORT};
     server_name _;
@@ -86,6 +89,13 @@ ${allow_block}
         proxy_ssl_verify off;
         proxy_hide_header Set-Cookie;
         proxy_http_version 1.1;
+
+        # Cache the decoy so many edges don't hammer the origin (avoids 429).
+        proxy_cache pgfb;
+        proxy_cache_valid 200 302 10m;
+        proxy_cache_valid any 1m;
+        proxy_ignore_headers Cache-Control Expires Set-Cookie;
+        add_header X-Cache-Status \$upstream_cache_status;
     }
 }
 EOF
@@ -290,10 +300,58 @@ do_install(){
     esac
 }
 
+edit_menu(){
+    if ! is_installed; then err "Not installed. Use option 1."; pause; return; fi
+    load_config
+    while true; do
+        clear
+        echo "=== Edit Configuration (role: ${ROLE}) ==="
+        echo " 1) Fake SNI domain   [current: ${FAKE_SNI}]"
+        if [[ "$ROLE" == "relay" ]]; then
+            echo " 2) Relay port        [current: ${RELAY_PORT}]"
+            echo " 3) Allowed edge IPs  [current: ${ALLOWED_IPS:-ANY}]"
+        else
+            echo " 2) Fallback port     [current: ${FALLBACK_PORT}]"
+            echo " 3) Source            [current: ${SOURCE}]"
+            echo " 4) Relay address     [current: ${RELAY_ADDR:-n/a}]"
+            echo " 5) PROXY protocol    [current: ${PROXY_VER}]"
+        fi
+        echo " 0) Back"
+        echo
+        read -rp "Select: " ch
+        case "$ch" in
+            1) read -rp "New SNI (0=cancel): " v; [[ "$v" == "0" || -z "$v" ]] && { warn "Unchanged."; pause; continue; }; FAKE_SNI="$v";;
+            2) if [[ "$ROLE" == "relay" ]]; then
+                   read -rp "New relay port (0=cancel): " v; [[ "$v" == "0" || -z "$v" ]] && { warn "Unchanged."; pause; continue; }; RELAY_PORT="$v"
+               else
+                   read -rp "New fallback port (0=cancel): " v; [[ "$v" == "0" || -z "$v" ]] && { warn "Unchanged."; pause; continue; }; FALLBACK_PORT="$v"
+               fi;;
+            3) if [[ "$ROLE" == "relay" ]]; then
+                   echo "New allowed IPs (space-separated, empty=any):"; read -rp "> " ALLOWED_IPS
+               else
+                   echo "Source: 1) relay  2) direct  3) static"; read -rp "Select: " s
+                   case "$s" in 1) SOURCE="relay"; read -rp "Relay address (IP:port): " RELAY_ADDR;; 2) SOURCE="direct";; 3) SOURCE="static"; populate_static;; *) warn "Unchanged."; pause; continue;; esac
+               fi;;
+            4) [[ "$ROLE" == "relay" ]] && { warn "N/A for relay."; pause; continue; }
+               read -rp "New relay address IP:port (0=cancel): " v; [[ "$v" == "0" || -z "$v" ]] && { warn "Unchanged."; pause; continue; }; RELAY_ADDR="$v"; SOURCE="relay";;
+            5) [[ "$ROLE" == "relay" ]] && { warn "N/A for relay."; pause; continue; }
+               if [[ "$PROXY_VER" == "on" ]]; then PROXY_VER="off"; log "xver -> 0 in panel."; else PROXY_VER="on"; log "xver -> 1 or 2 in panel."; fi;;
+            0) return;;
+            *) err "Invalid."; pause; continue;;
+        esac
+        apply && save_config && log "Updated."
+        pause
+    done
+}
+
 do_remove(){
     if ! is_installed; then err "Nothing to remove."; pause; return; fi
     read -rp "Remove fallback config? [y/N]: " c; [[ "$c" =~ ^[Yy]$ ]] || { warn "Cancelled."; return; }
-    rm -f "$FALLBACK_CONF" "$RELAY_CONF" "$CONFIG_FILE"; rm -rf "$STATIC_DIR"
+    rm -f "$FALLBACK_CONF" "$RELAY_CONF" "$CONFIG_FILE"; rm -rf "$STATIC_DIR" /var/cache/nginx/pg-fallback
+    nginx -t && systemctl reload nginx 2>/dev/null || true
+    log "Removed."; pause
+    read -rp "Remove fallback config? [y/N]: " c; [[ "$c" =~ ^[Yy]$ ]] || { warn "Cancelled."; return; }
+    rm -f "$FALLBACK_CONF" "$RELAY_CONF" "$CONFIG_FILE"; rm -rf "$STATIC_DIR" /var/cache/nginx/pg-fallback
     nginx -t && systemctl reload nginx 2>/dev/null || true
     log "Removed."; pause
 }
@@ -326,7 +384,7 @@ main_menu(){
         cat <<'B'
 ╔══════════════════════════════════════════════════╗
 ║            PasarGuard Fallback Manager           ║
-║                       v1.3                       ║
+║                       v1.4                       ║
 ╠══════════════════════════════════════════════════╣
 ║ By     : Meysam                                  ║
 ║ GitHub : github.com/logi443/nginx                ║
@@ -341,15 +399,17 @@ B
         fi
         echo "------------------------------------------------"
         echo " 1) Install"
-        echo " 2) Remove"
-        echo " 3) Service status / test"
+        echo " 2) Edit configuration"
+        echo " 3) Remove"
+        echo " 4) Service status / test"
         echo " 0) Exit"
         echo "================================================"
         read -rp "Select an option: " choice
         case "$choice" in
             1) do_install;;
-            2) do_remove;;
-            3) do_status;;
+            2) edit_menu;;
+            3) do_remove;;
+            4) do_status;;
             0) echo "Bye."; exit 0;;
             *) err "Invalid option."; pause;;
         esac
